@@ -2,9 +2,7 @@
 
 A self-hosted, multi-client alternative to relying on GitHub's hosted
 services — a "GitHub replacement" server that runs entirely on
-infrastructure you control, inspired by the local-execution ideas behind
-[celld](https://x.com/rough__sea/status/2093443347902038115) (self-hosted
-Cloudflare Durable Objects). The backend is a Rust service scaffolded from
+infrastructure you control. The backend is a Rust service scaffolded from
 [console-kit](https://github.com/EeroEternal/console-kit).
 
 gitcell is an **online service**: a single server process can host many
