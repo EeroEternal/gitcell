@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitcell"
+version = "0.1.0"
+description = "Local-first Git companion: local git ops, agent prompt history, and local Action-style workflows."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+gitcell = "gitcell.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gitcell*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
