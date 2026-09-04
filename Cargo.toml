@@ -1,0 +1,27 @@
+[package]
+name = "gitcell"
+version = "0.1.0"
+edition = "2024"
+authors = ["EeroEternal"]
+description = "Local-first, multi-client git companion server: git ops, agent prompt history, and Action-style workflows."
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+axum = { version = "0.8", features = ["json", "ws", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cellz = { version = "0.2", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }
+anyhow = "1.0"
+thiserror = "2.0"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tokio-test = "0.4"
+http-body-util = "0.1"
+tempfile = "3.14"

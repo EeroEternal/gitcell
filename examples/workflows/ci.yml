@@ -1,0 +1,11 @@
+name: CI
+on: [push, manual]
+env:
+  GREETING: "hello from gitcell"
+jobs:
+  build:
+    steps:
+      - name: Greet
+        run: echo "$GREETING"
+      - name: Show shell
+        run: uname -a
