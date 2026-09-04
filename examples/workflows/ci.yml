@@ -1,5 +1,5 @@
 name: CI
-on: [push, manual]
+on: [commit, push, manual]
 env:
   GREETING: "hello from gitcell"
 jobs:

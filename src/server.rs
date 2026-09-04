@@ -25,10 +25,18 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/api/v1/ping", get(ping))
+        .route("/api/v1/repos", get(repos_list))
         .route("/api/v1/repos/{repo}/init", post(repo_init))
         .route("/api/v1/repos/{repo}/status", get(repo_status))
+        .route("/api/v1/repos/{repo}/diff", get(repo_diff))
         .route("/api/v1/repos/{repo}/commit", post(repo_commit))
         .route("/api/v1/repos/{repo}/log", get(repo_log))
+        .route(
+            "/api/v1/repos/{repo}/branches",
+            get(repo_branches).post(repo_create_branch),
+        )
+        .route("/api/v1/repos/{repo}/checkout", post(repo_checkout))
+        .route("/api/v1/repos/{repo}/show/{rev}", get(repo_show))
         .route(
             "/api/v1/repos/{repo}/prompts",
             get(prompts_list).post(prompts_record),
@@ -41,6 +49,21 @@ pub fn create_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+fn require_repo(data_dir: &std::path::Path, repo: &str) -> Result<std::path::PathBuf> {
+    let path = git_ops::repo_path(data_dir, repo)?;
+    if !git_ops::is_git_repo(&path) {
+        return Err(Error::NotFound(format!("repository {repo:?} not found")));
+    }
+    Ok(path)
+}
+
+fn head_context(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    (
+        git_ops::head_sha(path).ok(),
+        git_ops::current_branch(path).ok(),
+    )
 }
 
 async fn health_check() -> Json<Value> {
@@ -56,6 +79,11 @@ async fn ping() -> Json<Value> {
     }))
 }
 
+async fn repos_list(State(state): State<AppState>) -> Result<Json<Value>> {
+    let repos = git_ops::list_repos(&state.data_dir)?;
+    Ok(Json(json!({ "repos": repos })))
+}
+
 async fn repo_init(
     State(state): State<AppState>,
     AxumPath(repo): AxumPath<String>,
@@ -69,12 +97,21 @@ async fn repo_status(
     State(state): State<AppState>,
     AxumPath(repo): AxumPath<String>,
 ) -> Result<Json<Value>> {
-    let path = git_ops::repo_path(&state.data_dir, &repo)?;
-    if !git_ops::is_git_repo(&path) {
-        return Err(Error::NotFound(format!("repository {repo:?} not found")));
-    }
+    let path = require_repo(&state.data_dir, &repo)?;
     let status = git_ops::status(&path)?;
     Ok(Json(json!({ "repo": repo, "status": status })))
+}
+
+async fn repo_diff(
+    State(state): State<AppState>,
+    AxumPath(repo): AxumPath<String>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    let diff = git_ops::diff(&path)?;
+    let status = git_ops::status(&path)?;
+    Ok(Json(
+        json!({ "repo": repo, "diff": diff, "status": status }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,10 +126,7 @@ async fn repo_commit(
     AxumPath(repo): AxumPath<String>,
     Json(payload): Json<CommitRequest>,
 ) -> Result<Json<Value>> {
-    let path = git_ops::repo_path(&state.data_dir, &repo)?;
-    if !git_ops::is_git_repo(&path) {
-        return Err(Error::NotFound(format!("repository {repo:?} not found")));
-    }
+    let path = require_repo(&state.data_dir, &repo)?;
     if payload.message.trim().is_empty() {
         return Err(Error::InvalidRequest(
             "commit message must not be empty".into(),
@@ -100,7 +134,32 @@ async fn repo_commit(
     }
     git_ops::add(&path, &payload.paths)?;
     let result = git_ops::commit(&path, &payload.message)?;
-    Ok(Json(json!({ "repo": repo, "output": result.stdout })))
+    let sha = git_ops::head_sha(&path).ok();
+    let branch = git_ops::current_branch(&path).ok();
+
+    if let (Some(sha), Some(branch)) = (sha.as_deref(), branch.as_deref()) {
+        let _ = storage::record_commit(
+            &state.cell_manager,
+            &repo,
+            sha,
+            payload.message.trim(),
+            branch,
+        )
+        .await;
+    }
+
+    let workflows = workflow::run_for_event(&path, "commit").unwrap_or_default();
+    for wf in &workflows {
+        let _ = storage::record_workflow(&state.cell_manager, &repo, sha.as_deref(), wf).await;
+    }
+
+    Ok(Json(json!({
+        "repo": repo,
+        "sha": sha,
+        "branch": branch,
+        "output": result.stdout,
+        "workflows": workflows,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,24 +172,93 @@ async fn repo_log(
     AxumPath(repo): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> Result<Json<Value>> {
-    let path = git_ops::repo_path(&state.data_dir, &repo)?;
-    if !git_ops::is_git_repo(&path) {
-        return Err(Error::NotFound(format!("repository {repo:?} not found")));
-    }
+    let path = require_repo(&state.data_dir, &repo)?;
     let log = git_ops::log(&path, query.limit.unwrap_or(10))?;
     Ok(Json(json!({ "repo": repo, "log": log })))
+}
+
+async fn repo_branches(
+    State(state): State<AppState>,
+    AxumPath(repo): AxumPath<String>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    let branches = git_ops::branches(&path)?;
+    let current = git_ops::current_branch(&path).ok();
+    Ok(Json(
+        json!({ "repo": repo, "branches": branches, "current": current }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchRequest {
+    name: String,
+    #[serde(default)]
+    checkout: bool,
+}
+
+async fn repo_create_branch(
+    State(state): State<AppState>,
+    AxumPath(repo): AxumPath<String>,
+    Json(payload): Json<BranchRequest>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    git_ops::create_branch(&path, &payload.name)?;
+    if payload.checkout {
+        git_ops::checkout(&path, &payload.name)?;
+    }
+    Ok(Json(json!({
+        "repo": repo,
+        "branch": payload.name,
+        "current": git_ops::current_branch(&path).ok(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckoutRequest {
+    name: String,
+}
+
+async fn repo_checkout(
+    State(state): State<AppState>,
+    AxumPath(repo): AxumPath<String>,
+    Json(payload): Json<CheckoutRequest>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    git_ops::checkout(&path, &payload.name)?;
+    Ok(Json(json!({
+        "repo": repo,
+        "current": git_ops::current_branch(&path).ok(),
+    })))
+}
+
+async fn repo_show(
+    State(state): State<AppState>,
+    AxumPath((repo, rev)): AxumPath<(String, String)>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    let show = git_ops::show(&path, &rev)?;
+    Ok(Json(json!({ "repo": repo, "rev": rev, "show": show })))
 }
 
 async fn prompts_record(
     State(state): State<AppState>,
     AxumPath(repo): AxumPath<String>,
-    Json(payload): Json<NewInteraction>,
+    Json(mut payload): Json<NewInteraction>,
 ) -> Result<Json<Value>> {
     git_ops::validate_repo_name(&repo)?;
     if payload.role.trim().is_empty() || payload.content.trim().is_empty() {
         return Err(Error::InvalidRequest(
             "role and content must not be empty".into(),
         ));
+    }
+    if let Ok(path) = require_repo(&state.data_dir, &repo) {
+        let (sha, branch) = head_context(&path);
+        if payload.commit.is_none() {
+            payload.commit = sha;
+        }
+        if payload.branch.is_none() {
+            payload.branch = branch;
+        }
     }
     let interaction = storage::record(&state.cell_manager, &repo, payload).await?;
     Ok(Json(json!(interaction)))
@@ -139,6 +267,8 @@ async fn prompts_record(
 #[derive(Debug, Deserialize)]
 struct PromptsListQuery {
     role: Option<String>,
+    commit: Option<String>,
+    since: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -148,10 +278,18 @@ async fn prompts_list(
     Query(query): Query<PromptsListQuery>,
 ) -> Result<Json<Value>> {
     git_ops::validate_repo_name(&repo)?;
+    let commit_filter = match query.commit.as_deref() {
+        Some("HEAD") => require_repo(&state.data_dir, &repo)
+            .ok()
+            .and_then(|path| git_ops::head_sha(&path).ok()),
+        other => other.map(str::to_string),
+    };
     let interactions = storage::list(
         &state.cell_manager,
         &repo,
         query.role.as_deref(),
+        commit_filter.as_deref(),
+        query.since,
         query.limit.unwrap_or(20),
     )
     .await?;

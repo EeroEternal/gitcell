@@ -1,6 +1,4 @@
-//! Thin wrappers around common git operations, scoped by repository name so
-//! a single gitcell server instance can host many repositories for many
-//! clients.
+//! Thin wrappers around common git operations, scoped by repository name.
 //!
 //! gitcell does not reimplement git; it shells out to the system `git`
 //! binary underneath each managed repository's working directory.
@@ -9,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
+
+const IDENTITY_NAME: &str = "gitcell";
+const IDENTITY_EMAIL: &str = "gitcell@localhost";
 
 /// Validate a repository name to prevent path traversal or escaping the
 /// configured data directory. Only ASCII alphanumerics, `-`, and `_` are
@@ -26,6 +27,23 @@ pub fn validate_repo_name(name: &str) -> Result<()> {
         return Err(Error::InvalidRequest(format!(
             "invalid repository name: {name:?} (only alphanumerics, '-', and '_' are allowed)"
         )));
+    }
+    Ok(())
+}
+
+/// Validate a git ref (branch name or SHA-ish token).
+pub fn validate_ref(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.starts_with('-') {
+        return Err(Error::InvalidRequest(format!("invalid git ref: {name:?}")));
+    }
+    if name.contains("..") || name.contains('\0') {
+        return Err(Error::InvalidRequest(format!("invalid git ref: {name:?}")));
+    }
+    let valid = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'));
+    if !valid {
+        return Err(Error::InvalidRequest(format!("invalid git ref: {name:?}")));
     }
     Ok(())
 }
@@ -62,20 +80,71 @@ fn require_ok(result: GitOutput) -> Result<GitOutput> {
     if result.success {
         Ok(result)
     } else {
-        Err(Error::Git(result.stderr))
+        let msg = if result.stderr.is_empty() {
+            result.stdout
+        } else if result.stdout.is_empty() {
+            result.stderr
+        } else {
+            format!("{}\n{}", result.stderr, result.stdout)
+        };
+        Err(Error::Git(msg))
     }
 }
 
+/// Set a local git identity when the repo has none, so commits work out of the box.
+pub fn ensure_identity(path: &Path) -> Result<()> {
+    let email = run(path, &["config", "--get", "user.email"])?;
+    if email.success && !email.stdout.is_empty() {
+        return Ok(());
+    }
+    require_ok(run(path, &["config", "user.email", IDENTITY_EMAIL])?)?;
+    require_ok(run(path, &["config", "user.name", IDENTITY_NAME])?)?;
+    Ok(())
+}
+
 /// Initialize a new git repository at `path`, creating the directory if
-/// needed.
+/// needed. Uses `main` as the default branch and installs a local identity.
 pub fn init(path: &Path) -> Result<GitOutput> {
     std::fs::create_dir_all(path)
         .map_err(|e| Error::Git(format!("failed to create repo directory: {e}")))?;
-    require_ok(run(path, &["init"])?)
+    let result = require_ok(run(path, &["init", "-b", "main"])?)?;
+    ensure_identity(path)?;
+    Ok(result)
+}
+
+pub fn list_repos(data_dir: &Path) -> Result<Vec<String>> {
+    if !data_dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(data_dir)
+        .map_err(|e| Error::Git(format!("failed to read {}: {e}", data_dir.display())))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Git(e.to_string()))?;
+        let file_type = entry.file_type().map_err(|e| Error::Git(e.to_string()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if validate_repo_name(&name).is_ok() && is_git_repo(&entry.path()) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 pub fn status(path: &Path) -> Result<String> {
     Ok(require_ok(run(path, &["status", "--short", "--branch"])?)?.stdout)
+}
+
+/// Working tree + index vs HEAD. Before the first commit, falls back to unstaged diff.
+pub fn diff(path: &Path) -> Result<String> {
+    let against_head = run(path, &["diff", "--no-color", "HEAD"])?;
+    if against_head.success {
+        return Ok(against_head.stdout);
+    }
+    Ok(require_ok(run(path, &["diff", "--no-color"])?)?.stdout)
 }
 
 pub fn add(path: &Path, paths: &[String]) -> Result<GitOutput> {
@@ -90,6 +159,7 @@ pub fn add(path: &Path, paths: &[String]) -> Result<GitOutput> {
 }
 
 pub fn commit(path: &Path, message: &str) -> Result<GitOutput> {
+    ensure_identity(path)?;
     require_ok(run(path, &["commit", "-m", message])?)
 }
 
@@ -107,6 +177,46 @@ pub fn log(path: &Path, limit: u32) -> Result<String> {
     .stdout)
 }
 
+pub fn head_sha(path: &Path) -> Result<String> {
+    Ok(require_ok(run(path, &["rev-parse", "HEAD"])?)?.stdout)
+}
+
+pub fn current_branch(path: &Path) -> Result<String> {
+    Ok(require_ok(run(path, &["rev-parse", "--abbrev-ref", "HEAD"])?)?.stdout)
+}
+
+pub fn branches(path: &Path) -> Result<Vec<String>> {
+    let output = require_ok(run(path, &["branch", "--format=%(refname:short)"])?)?;
+    if output.stdout.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut names: Vec<String> = output
+        .stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+pub fn create_branch(path: &Path, name: &str) -> Result<()> {
+    validate_ref(name)?;
+    require_ok(run(path, &["branch", name])?)?;
+    Ok(())
+}
+
+pub fn checkout(path: &Path, name: &str) -> Result<()> {
+    validate_ref(name)?;
+    require_ok(run(path, &["checkout", name])?)?;
+    Ok(())
+}
+
+pub fn show(path: &Path, rev: &str) -> Result<String> {
+    validate_ref(rev)?;
+    Ok(require_ok(run(path, &["show", "--stat", "--format=fuller", rev])?)?.stdout)
+}
+
 pub fn is_git_repo(path: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -120,11 +230,6 @@ pub fn is_git_repo(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn configure_identity(path: &Path) {
-        run(path, &["config", "user.email", "test@example.com"]).unwrap();
-        run(path, &["config", "user.name", "Test"]).unwrap();
-    }
 
     #[test]
     fn rejects_invalid_repo_names() {
@@ -143,19 +248,61 @@ mod tests {
     }
 
     #[test]
+    fn init_creates_main_and_commit_works_without_manual_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init(&repo).unwrap();
+        assert!(is_git_repo(&repo));
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        add(&repo, &[]).unwrap();
+        commit(&repo, "boot").unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "main");
+    }
+
+    #[test]
     fn init_status_commit_log_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
 
         init(&repo).unwrap();
-        assert!(is_git_repo(&repo));
-        configure_identity(&repo);
-
         std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
         add(&repo, &[]).unwrap();
         commit(&repo, "initial commit").unwrap();
 
         let log_output = log(&repo, 5).unwrap();
         assert!(log_output.contains("initial commit"));
+        assert_eq!(current_branch(&repo).unwrap(), "main");
+        assert!(!head_sha(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_and_branch_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init(&repo).unwrap();
+        std::fs::write(repo.join("file.txt"), "hello\n").unwrap();
+        add(&repo, &[]).unwrap();
+        commit(&repo, "initial").unwrap();
+
+        std::fs::write(repo.join("file.txt"), "hello world\n").unwrap();
+        let diff_text = diff(&repo).unwrap();
+        assert!(diff_text.contains("hello world"));
+
+        create_branch(&repo, "feat-x").unwrap();
+        let names = branches(&repo).unwrap();
+        assert!(names.iter().any(|n| n == "feat-x"));
+        checkout(&repo, "feat-x").unwrap();
+        assert_eq!(current_branch(&repo).unwrap(), "feat-x");
+    }
+
+    #[test]
+    fn list_repos_finds_git_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        init(&data.join("alpha")).unwrap();
+        init(&data.join("beta")).unwrap();
+        std::fs::create_dir_all(data.join("not-git")).unwrap();
+        let names = list_repos(data).unwrap();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 }

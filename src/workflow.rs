@@ -195,6 +195,28 @@ fn find_workflow_file(repo_path: &Path, name: &str) -> Result<PathBuf> {
     Err(Error::NotFound(format!("no workflow named {name:?} found")))
 }
 
+fn listens_for(events: &[String], event: &str) -> bool {
+    if events.is_empty() {
+        return true;
+    }
+    events.iter().any(|e| {
+        e == event || (event == "commit" && e == "push") || (event == "push" && e == "commit")
+    })
+}
+
+/// Run every workflow in the repo that listens for `event` (`commit` also
+/// matches workflows declared as `on: [push]`).
+pub fn run_for_event(repo_path: &Path, event: &str) -> Result<Vec<WorkflowResult>> {
+    let summaries = discover(repo_path)?;
+    let mut results = Vec::new();
+    for summary in summaries {
+        if listens_for(&summary.events, event) {
+            results.push(run(repo_path, &summary.name, None)?);
+        }
+    }
+    Ok(results)
+}
+
 /// Run a workflow by name, optionally restricted to a given trigger event.
 pub fn run(repo_path: &Path, name: &str, event: Option<&str>) -> Result<WorkflowResult> {
     let path = find_workflow_file(repo_path, name)?;
@@ -202,8 +224,7 @@ pub fn run(repo_path: &Path, name: &str, event: Option<&str>) -> Result<Workflow
     let events = normalize_events(&spec.on);
 
     if let Some(event) = event
-        && !events.is_empty()
-        && !events.iter().any(|e| e == event)
+        && !listens_for(&events, event)
     {
         return Err(Error::Workflow(format!(
             "workflow {name:?} does not listen for event {event:?}"

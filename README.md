@@ -78,36 +78,49 @@ cargo run
 
 ## API
 
+Working trees live on disk at `$GITCELL_DATA_DIR/<repo>` (default `./data/repos/<repo>`). Edit files there (or from an agent), then use the API for git, prompt history, and workflows.
+
 ```bash
-# Initialize a new repository
+# Initialize a new repository (creates main + a local git identity)
 curl -X POST http://localhost:8080/api/v1/repos/my-repo/init
 
-# Basic git operations
+# List repos, status, diff vs HEAD
+curl http://localhost:8080/api/v1/repos
 curl http://localhost:8080/api/v1/repos/my-repo/status
+curl http://localhost:8080/api/v1/repos/my-repo/diff
+
+# Commit (records gitcell.commit, runs on: commit/push workflows)
 curl -X POST http://localhost:8080/api/v1/repos/my-repo/commit \
   -H 'content-type: application/json' \
   -d '{"message": "initial commit"}'
 curl "http://localhost:8080/api/v1/repos/my-repo/log?limit=5"
 
-# Record and inspect agent prompt/response history
+# Branches
+curl http://localhost:8080/api/v1/repos/my-repo/branches
+curl -X POST http://localhost:8080/api/v1/repos/my-repo/branches \
+  -H 'content-type: application/json' \
+  -d '{"name": "feat-x", "checkout": true}'
+
+# Prompt history is pinned to HEAD by default
 curl -X POST http://localhost:8080/api/v1/repos/my-repo/prompts \
   -H 'content-type: application/json' \
   -d '{"role": "user", "content": "please add a login feature"}'
-curl http://localhost:8080/api/v1/repos/my-repo/prompts
+curl "http://localhost:8080/api/v1/repos/my-repo/prompts?commit=HEAD"
 
-# Discover and run local Action-style workflows
+# Workflows also still run on demand
 curl http://localhost:8080/api/v1/repos/my-repo/workflows
-curl -X POST "http://localhost:8080/api/v1/repos/my-repo/workflows/CI/run?event=push"
+curl -X POST "http://localhost:8080/api/v1/repos/my-repo/workflows/CI/run?event=commit"
 ```
 
 Workflow files use a small subset of the GitHub Actions schema, read from
 `<repo>/.gitcell/workflows/*.yml`; see
 [`examples/workflows/ci.yml`](examples/workflows/ci.yml) for a working
-example:
+example. A successful `commit` automatically runs workflows that listen
+for `commit` or `push`.
 
 ```yaml
 name: CI
-on: [push, manual]
+on: [commit, push, manual]
 env:
   GREETING: "hello from gitcell"
 jobs:

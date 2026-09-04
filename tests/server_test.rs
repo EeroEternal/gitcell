@@ -173,3 +173,112 @@ async fn test_workflows_list_empty_when_missing() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json.as_array().unwrap().len(), 0);
 }
+
+async fn json_request(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let body = if let Some(payload) = body {
+        builder = builder.header("content-type", "application/json");
+        Body::from(payload.to_string())
+    } else {
+        Body::empty()
+    };
+    let response = app.oneshot(builder.body(body).unwrap()).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    };
+    (status, json)
+}
+
+#[tokio::test]
+async fn personal_loop_init_commit_workflow_prompt_log() {
+    let (state, tmp) = test_state().await;
+    let data_dir = state.data_dir.clone();
+    let app = server::create_router(state);
+
+    let (status, _) = json_request(app.clone(), "POST", "/api/v1/repos/demo/init", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let repo = data_dir.join("demo");
+    std::fs::write(repo.join("README.md"), "hello gitcell\n").unwrap();
+    let wf_dir = repo.join(".gitcell/workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("ci.yml"),
+        "name: CI\non: [push]\njobs:\n  build:\n    steps:\n      - name: ok\n        run: echo ci-ok\n",
+    )
+    .unwrap();
+
+    let (status, commit) = json_request(
+        app.clone(),
+        "POST",
+        "/api/v1/repos/demo/commit",
+        Some(serde_json::json!({"message": "initial commit"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "commit failed: {commit}");
+    let sha = commit["sha"].as_str().unwrap().to_string();
+    assert!(!sha.is_empty());
+    assert_eq!(commit["branch"], "main");
+    assert_eq!(commit["workflows"][0]["name"], "CI");
+    assert_eq!(
+        commit["workflows"][0]["jobs"][0]["steps"][0]["success"],
+        true
+    );
+
+    let (status, prompt) = json_request(
+        app.clone(),
+        "POST",
+        "/api/v1/repos/demo/prompts",
+        Some(serde_json::json!({
+            "role": "user",
+            "content": "add a readme"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(prompt["content"], "add a readme");
+    assert_eq!(prompt["commit"], sha);
+    assert_eq!(prompt["branch"], "main");
+
+    let (status, listed) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/v1/repos/demo/prompts?commit={sha}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    let (status, log) = json_request(app.clone(), "GET", "/api/v1/repos/demo/log", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(log["log"].as_str().unwrap().contains("initial commit"));
+
+    let (status, repos) = json_request(app.clone(), "GET", "/api/v1/repos", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repos["repos"], serde_json::json!(["demo"]));
+
+    let (status, _) = json_request(
+        app.clone(),
+        "POST",
+        "/api/v1/repos/demo/branches",
+        Some(serde_json::json!({"name": "feat-x", "checkout": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, branches) =
+        json_request(app.clone(), "GET", "/api/v1/repos/demo/branches", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(branches["current"], "feat-x");
+
+    let _ = tmp;
+}
