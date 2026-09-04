@@ -37,6 +37,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/repos/{repo}/checkout", post(repo_checkout))
         .route("/api/v1/repos/{repo}/show/{rev}", get(repo_show))
+        .route("/api/v1/repos/{repo}/tree", get(repo_tree))
+        .route(
+            "/api/v1/repos/{repo}/files/{*path}",
+            get(repo_get_file).put(repo_put_file),
+        )
         .route(
             "/api/v1/repos/{repo}/prompts",
             get(prompts_list).post(prompts_record),
@@ -238,6 +243,43 @@ async fn repo_show(
     let path = require_repo(&state.data_dir, &repo)?;
     let show = git_ops::show(&path, &rev)?;
     Ok(Json(json!({ "repo": repo, "rev": rev, "show": show })))
+}
+
+async fn repo_tree(
+    State(state): State<AppState>,
+    AxumPath(repo): AxumPath<String>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    let tree = git_ops::list_tree(&path)?;
+    Ok(Json(json!({ "repo": repo, "tree": tree })))
+}
+
+async fn repo_get_file(
+    State(state): State<AppState>,
+    AxumPath((repo, file_path)): AxumPath<(String, String)>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    let content = git_ops::read_file(&path, &file_path)?;
+    Ok(Json(
+        json!({ "repo": repo, "path": file_path, "content": content }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct FilePutRequest {
+    content: String,
+}
+
+async fn repo_put_file(
+    State(state): State<AppState>,
+    AxumPath((repo, file_path)): AxumPath<(String, String)>,
+    Json(payload): Json<FilePutRequest>,
+) -> Result<Json<Value>> {
+    let path = require_repo(&state.data_dir, &repo)?;
+    git_ops::write_file(&path, &file_path, &payload.content)?;
+    Ok(Json(
+        json!({ "repo": repo, "path": file_path, "written": true }),
+    ))
 }
 
 async fn prompts_record(

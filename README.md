@@ -89,6 +89,13 @@ curl http://localhost:8080/api/v1/repos
 curl http://localhost:8080/api/v1/repos/my-repo/status
 curl http://localhost:8080/api/v1/repos/my-repo/diff
 
+# Working tree files (UTF-8). `.git` is blocked.
+curl -X PUT http://localhost:8080/api/v1/repos/my-repo/files/src/main.rs \
+  -H 'content-type: application/json' \
+  -d '{"content": "fn main() {}\n"}'
+curl http://localhost:8080/api/v1/repos/my-repo/files/src/main.rs
+curl http://localhost:8080/api/v1/repos/my-repo/tree
+
 # Commit (records gitcell.commit, runs on: commit/push workflows)
 curl -X POST http://localhost:8080/api/v1/repos/my-repo/commit \
   -H 'content-type: application/json' \

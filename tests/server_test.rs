@@ -269,6 +269,37 @@ async fn personal_loop_init_commit_workflow_prompt_log() {
 
     let (status, _) = json_request(
         app.clone(),
+        "PUT",
+        "/api/v1/repos/demo/files/src/hello.txt",
+        Some(serde_json::json!({"content": "from api\n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, file) = json_request(
+        app.clone(),
+        "GET",
+        "/api/v1/repos/demo/files/src/hello.txt",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(file["content"], "from api\n");
+    let (status, tree) = json_request(app.clone(), "GET", "/api/v1/repos/demo/tree", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let tree = tree["tree"].as_array().unwrap();
+    assert!(tree.iter().any(|e| e["path"] == "src/hello.txt"));
+
+    let (status, _) = json_request(
+        app.clone(),
+        "GET",
+        "/api/v1/repos/demo/files/.git/config",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = json_request(
+        app.clone(),
         "POST",
         "/api/v1/repos/demo/branches",
         Some(serde_json::json!({"name": "feat-x", "checkout": true})),
