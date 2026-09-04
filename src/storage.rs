@@ -1,19 +1,30 @@
-//! Central storage for agent/prompt interaction history.
+//! Central storage for agent/prompt interaction history, backed by the
+//! embedded [`cellz`](https://crates.io/crates/cellz) event-sourced cell
+//! engine (`cellz = { version = "0.2", default-features = false }`).
 //!
 //! Every prompt exchanged with an agent (human prompt, agent response,
-//! tool call, etc.) is recorded in a single SQLite database shared by all
-//! repositories hosted by this gitcell server, keyed by repository name so
-//! multiple clients/repositories can be served from one instance.
+//! tool call, etc.) for a given repository is appended as a durable
+//! `gitcell.prompt` event to that repository's `cellz` cell -- one cell per
+//! repository, keyed by repository name -- so multiple clients/repositories
+//! can be served from a single gitcell instance while getting a replayable
+//! event log, KV state, and checkpoints for free from `cellz`.
 
+use cellz::cell::CellManager;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use serde_json::json;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+/// `cellz` event type used to record gitcell agent/prompt interactions.
+const PROMPT_EVENT_TYPE: &str = "gitcell.prompt";
+
+/// Number of past events fetched from a cell before filtering/limiting.
+const EVENT_FETCH_LIMIT: i64 = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interaction {
-    pub id: i64,
+    pub id: String,
     pub repo: String,
     pub role: String,
     pub content: String,
@@ -29,84 +40,90 @@ pub struct NewInteraction {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Run pending migrations against the given pool.
-pub async fn migrate(pool: &SqlitePool) -> Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
-    Ok(())
+/// Append a prompt/response interaction to the repository's `cellz` cell.
+pub async fn record(
+    manager: &CellManager,
+    repo: &str,
+    payload: NewInteraction,
+) -> Result<Interaction> {
+    let handle = manager.get_or_activate(repo).await?;
+
+    let event_payload = json!({
+        "role": payload.role,
+        "content": payload.content,
+        "metadata": payload.metadata,
+    });
+
+    let event = handle
+        .append_event(None, PROMPT_EVENT_TYPE, event_payload)
+        .await?;
+
+    event_to_interaction(repo, event)
 }
 
-pub async fn record(pool: &SqlitePool, repo: &str, payload: NewInteraction) -> Result<Interaction> {
-    let metadata_json = payload
-        .metadata
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|e| crate::error::Error::InvalidRequest(format!("invalid metadata: {e}")))?;
-
-    let row = sqlx::query(
-        "INSERT INTO interactions (repo, role, content, metadata, created_at) \
-         VALUES (?, ?, ?, ?, ?) \
-         RETURNING id, repo, role, content, metadata, created_at",
-    )
-    .bind(repo)
-    .bind(&payload.role)
-    .bind(&payload.content)
-    .bind(&metadata_json)
-    .bind(Utc::now())
-    .fetch_one(pool)
-    .await?;
-
-    row_to_interaction(row)
-}
-
+/// List recorded interactions for a repository, optionally filtered by
+/// role, most recent `limit` entries in chronological order.
 pub async fn list(
-    pool: &SqlitePool,
+    manager: &CellManager,
     repo: &str,
     role: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Interaction>> {
-    let rows = if let Some(role) = role {
-        sqlx::query(
-            "SELECT id, repo, role, content, metadata, created_at FROM interactions \
-             WHERE repo = ? AND role = ? ORDER BY id DESC LIMIT ?",
-        )
-        .bind(repo)
-        .bind(role)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT id, repo, role, content, metadata, created_at FROM interactions \
-             WHERE repo = ? ORDER BY id DESC LIMIT ?",
-        )
-        .bind(repo)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
+    let handle = manager.get_or_activate(repo).await?;
 
-    let mut interactions = rows
+    let events = handle.get_events(None, Some(EVENT_FETCH_LIMIT)).await?;
+
+    let mut interactions = events
         .into_iter()
-        .map(row_to_interaction)
-        .collect::<Result<Vec<_>>>()?;
-    interactions.reverse();
+        .filter(|event| event.event_type == PROMPT_EVENT_TYPE)
+        .filter_map(|event| event_to_interaction(repo, event).ok())
+        .filter(|interaction| role.is_none_or(|r| interaction.role == r))
+        .collect::<Vec<_>>();
+
+    let limit = limit.max(0) as usize;
+    if interactions.len() > limit {
+        let skip = interactions.len() - limit;
+        interactions = interactions.split_off(skip);
+    }
+
     Ok(interactions)
 }
 
-fn row_to_interaction(row: sqlx::sqlite::SqliteRow) -> Result<Interaction> {
-    let metadata_str: Option<String> = row.try_get("metadata")?;
-    let metadata = metadata_str
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .map_err(|e| crate::error::Error::Internal(anyhow::anyhow!(e)))?;
+fn event_to_interaction(
+    repo: &str,
+    event: cellz::model::event::EventRecord,
+) -> Result<Interaction> {
+    let role = event
+        .payload
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let content = event
+        .payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let metadata = event
+        .payload
+        .get("metadata")
+        .cloned()
+        .filter(|v| !v.is_null());
+
+    if role.is_empty() {
+        return Err(Error::Internal(anyhow::anyhow!(
+            "malformed gitcell.prompt event {} in cell {repo:?}: missing role",
+            event.id
+        )));
+    }
 
     Ok(Interaction {
-        id: row.try_get("id")?,
-        repo: row.try_get("repo")?,
-        role: row.try_get("role")?,
-        content: row.try_get("content")?,
+        id: event.id,
+        repo: repo.to_string(),
+        role,
+        content,
         metadata,
-        created_at: row.try_get("created_at")?,
+        created_at: event.created_at,
     })
 }

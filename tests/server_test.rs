@@ -1,24 +1,30 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use cellz::cell::CellManager;
+use cellz::storage::LocalBlobStore;
 use gitcell::server::{self, AppState};
 use http_body_util::BodyExt;
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::ServiceExt;
 
 async fn test_state() -> (AppState, tempfile::TempDir) {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    gitcell::storage::migrate(&pool).await.unwrap();
-
     let tmp = tempfile::tempdir().unwrap();
+    let cells_dir = tmp.path().join("cells");
+    let cells_storage_dir = tmp.path().join("cells-storage");
+    let data_dir = tmp.path().join("repos");
+    std::fs::create_dir_all(&cells_dir).unwrap();
+    std::fs::create_dir_all(&cells_storage_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let blob_store = Arc::new(LocalBlobStore::new(&cells_storage_dir));
+    let cell_manager = Arc::new(CellManager::new(&cells_dir, blob_store, 60));
+
     let state = AppState {
-        pool,
-        data_dir: tmp.path().to_path_buf(),
+        cell_manager,
+        data_dir,
     };
     (state, tmp)
 }

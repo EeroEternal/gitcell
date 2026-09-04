@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
     routing::{get, post},
 };
+use cellz::cell::CellManager;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -15,7 +17,7 @@ use crate::{git_ops, workflow};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
+    pub cell_manager: Arc<CellManager>,
     pub data_dir: std::path::PathBuf,
 }
 
@@ -130,7 +132,7 @@ async fn prompts_record(
             "role and content must not be empty".into(),
         ));
     }
-    let interaction = storage::record(&state.pool, &repo, payload).await?;
+    let interaction = storage::record(&state.cell_manager, &repo, payload).await?;
     Ok(Json(json!(interaction)))
 }
 
@@ -147,7 +149,7 @@ async fn prompts_list(
 ) -> Result<Json<Value>> {
     git_ops::validate_repo_name(&repo)?;
     let interactions = storage::list(
-        &state.pool,
+        &state.cell_manager,
         &repo,
         query.role.as_deref(),
         query.limit.unwrap_or(20),

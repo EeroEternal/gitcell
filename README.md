@@ -14,8 +14,10 @@ repositories and be accessed concurrently by many clients over HTTP.
    (`init`, `status`, `commit`, `log`), scoped per repository so one
    server can manage many repos.
 2. **Agent prompt history** — every prompt/response exchanged with an AI
-   agent can be recorded (SQLite via `sqlx`), keyed by repository, so you
-   keep a durable, queryable record of how the code changed.
+   agent is recorded as durable, replayable events via the embedded
+   [`cellz`](https://crates.io/crates/cellz) event-sourced cell engine
+   (one `cellz` cell per repository), keyed by repository, so you keep a
+   durable, queryable record of how the code changed.
 3. **Local Action-style workflows** — a minimal, GitHub Actions-like YAML
    runner that executes workflow steps on the server host (no
    containerization, no remote cloud runners), reading definitions from
@@ -27,24 +29,29 @@ repositories and be accessed concurrently by many clients over HTTP.
   Tokio + Tower + Tracing, scaffolded from
   [console-kit](https://github.com/EeroEternal/console-kit)'s backend
   starter.
-- **Storage**: `sqlx` + SQLite (`gitcell.db`) for agent prompt/interaction
-  history; each managed git repository lives under `GITCELL_DATA_DIR`
-  (default `./data/repos/<repo>`) as a plain git working tree.
+- **Storage**: [`cellz`](https://crates.io/crates/cellz)
+  (`cellz = { version = "0.2", default-features = false }`, embedded, no
+  HTTP stack of its own) for agent prompt/interaction history — each
+  repository maps 1:1 to a `cellz` cell (an isolated, single-writer
+  SQLite event log under `GITCELL_CELLS_DIR`), giving gitcell a durable,
+  replayable event log for prompts/responses. Each managed git repository
+  lives under `GITCELL_DATA_DIR` (default `./data/repos/<repo>`) as a
+  plain git working tree.
 - **Multi-tenancy**: every API route is scoped by a `{repo}` path segment;
   repository names are validated (`^[A-Za-z0-9_-]+$`) to prevent path
-  traversal outside the data directory.
+  traversal outside the data directory (this also keeps `cellz` cell IDs
+  filesystem-safe, since gitcell uses the repository name as the cell ID).
 
 ```
 src/
-  main.rs      - process entrypoint, wiring config/db/router
+  main.rs      - process entrypoint, wiring config/cellz/router
   lib.rs       - crate root
   config.rs    - environment-driven configuration
   error.rs     - unified error type -> HTTP response mapping
   server.rs    - Axum router and HTTP handlers
   git_ops.rs   - git CLI wrappers, repo path/name validation
-  storage.rs   - sqlx-backed agent prompt/interaction history
+  storage.rs   - cellz-backed agent prompt/interaction history
   workflow.rs  - local Action-style workflow discovery & execution
-migrations/    - sqlx migrations (interactions table)
 tests/         - integration tests (Axum router via `tower::ServiceExt`)
 ```
 
@@ -58,8 +65,10 @@ clients/environments without rebuilding:
 | --- | --- | --- |
 | `GITCELL_HOST` | `0.0.0.0` | Bind address |
 | `GITCELL_PORT` | `8080` | Bind port |
-| `GITCELL_DATABASE_URL` | `sqlite://gitcell.db?mode=rwc` | Prompt-history database |
 | `GITCELL_DATA_DIR` | `./data/repos` | Root directory holding managed git repositories |
+| `GITCELL_CELLS_DIR` | `./data/cells` | Root directory for `cellz` per-repo event logs (prompt history) |
+| `GITCELL_CELLS_STORAGE_DIR` | `./data/cells-storage` | Blob storage used by `cellz` for cell snapshots/backups/leases |
+| `GITCELL_CELLS_LEASE_TTL_SECS` | `60` | Single-writer lease TTL for `cellz` cells |
 
 ## Running
 

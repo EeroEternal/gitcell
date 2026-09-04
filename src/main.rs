@@ -1,5 +1,8 @@
-use gitcell::{config::Config, error::Result, server, storage};
-use sqlx::sqlite::SqlitePoolOptions;
+use std::sync::Arc;
+
+use cellz::cell::CellManager;
+use cellz::storage::LocalBlobStore;
+use gitcell::{config::Config, error::Result, server};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,17 +19,25 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create data dir {:?}: {}", config.data_dir, e))?;
+    std::fs::create_dir_all(&config.cells_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create cells dir {:?}: {}", config.cells_dir, e))?;
+    std::fs::create_dir_all(&config.cells_storage_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create cells storage dir {:?}: {}",
+            config.cells_storage_dir,
+            e
+        )
+    })?;
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&config.database_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
-
-    storage::migrate(&pool).await?;
+    let blob_store = Arc::new(LocalBlobStore::new(&config.cells_storage_dir));
+    let cell_manager = Arc::new(CellManager::new(
+        &config.cells_dir,
+        blob_store,
+        config.cells_lease_ttl_secs,
+    ));
 
     let state = server::AppState {
-        pool,
+        cell_manager,
         data_dir: config.data_dir.clone(),
     };
     let app = server::create_router(state);
