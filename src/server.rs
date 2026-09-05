@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use cellz::cell::CellManager;
+use cellz::storage::LocalBlobStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
@@ -21,10 +22,31 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
 }
 
-pub fn create_router(state: AppState) -> Router {
+impl AppState {
+    pub fn new(
+        data_dir: impl AsRef<std::path::Path>,
+        cells_dir: impl AsRef<std::path::Path>,
+        cells_storage_dir: impl AsRef<std::path::Path>,
+        lease_ttl_secs: u64,
+    ) -> anyhow::Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let cells_dir = cells_dir.as_ref().to_path_buf();
+        let cells_storage_dir = cells_storage_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&data_dir)?;
+        std::fs::create_dir_all(&cells_dir)?;
+        std::fs::create_dir_all(&cells_storage_dir)?;
+        let blob_store = Arc::new(LocalBlobStore::new(&cells_storage_dir));
+        let cell_manager = Arc::new(CellManager::new(&cells_dir, blob_store, lease_ttl_secs));
+        Ok(Self {
+            cell_manager,
+            data_dir,
+        })
+    }
+}
+
+/// Repo / prompt / workflow API without `/health`. For embedding (e.g. OpenHub).
+pub fn api_router() -> Router<AppState> {
     Router::new()
-        .route("/health", get(health_check))
-        .route("/api/v1/ping", get(ping))
         .route("/api/v1/repos", get(repos_list))
         .route("/api/v1/repos/{repo}/init", post(repo_init))
         .route("/api/v1/repos/{repo}/status", get(repo_status))
@@ -51,6 +73,13 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/repos/{repo}/workflows/{name}/run",
             post(workflow_run),
         )
+}
+
+pub fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/api/v1/ping", get(ping))
+        .merge(api_router())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
