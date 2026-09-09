@@ -2,8 +2,16 @@
 name = "gitcell"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["EeroEternal"]
 description = "Local-first, multi-client git companion server: git ops, agent prompt history, and Action-style workflows."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/EeroEternal/gitcell"
+homepage = "https://github.com/EeroEternal/gitcell"
+documentation = "https://docs.rs/gitcell"
+keywords = ["git", "agent", "event-sourcing"]
+categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
